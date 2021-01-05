@@ -1,0 +1,119 @@
+#! /bin/bash
+cd /home/ubuntu/processdir
+
+lockfile=process.lock
+
+if [ -f "$lockfile" ]
+then
+	echo "Another process is running"
+	exit
+else
+	touch process.lock
+fi
+
+# Start by getting the message from the queue if there is one
+awssqsmessage=$(aws sqs receive-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingQueue)
+
+receipt=$(echo ${awssqsmessage} | jq '.Messages' | jq '.[0].ReceiptHandle' | tail -c +2 | head -c -2)
+
+# If there is no message waiting then exit
+
+if [ "$receipt" = "" ]
+then
+	rm process.lock
+	exit
+fi
+
+longfilename=$(echo ${awssqsmessage} | jq '.Messages' | jq '.[0].Body' | tr -d '\\' | tail -c +2 | head -c -2 | jq '.Records' | jq '.[0].s3.object.key' | tr -d '"')
+
+if [ "$longfilename" = "" ]
+then
+	rm process.lock
+	exit
+fi
+
+IFS='_' read -r -a array <<< $longfilename
+completionstatus=""
+completionmessage=""
+owner=${array[0]}
+room=${array[1]}
+team=${array[2]}
+filename=${array[3]}
+
+directory=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
+file=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
+filesequence=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
+
+jq -n --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" --arg owner "$owner" --arg room "$room" --arg team "$team" --arg filename "$filename" --arg directory "$directory" --arg file "$file" --arg filesequence "$filesequence" '. | .["completionstatus"]=$completionstatus | .[$completionmessage]=$completionmessage | .["owner"]=$owner | .["room"]=$room | .["team"]=$team | .["filename"]=$filename | .["directory"]=$directory | .["file"]=$file| .["filesequence"]=$filesequence' > db.json
+
+aws s3 mv s3://meetingroomv1uploads/${longfilename} . --quiet
+
+mv ${longfilename} ${filename}
+
+codec=$(/home/ubuntu/bin/ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 ${filename})
+	
+if [ "$codec" != "h264" ]
+then
+	echo "Not a h264 encoded file"
+	aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueue --message-body file://db.json
+	rm process.lock
+	exit
+fi
+
+aws sqs delete-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingQueue --receipt-handle "${receipt}"
+status=$?
+
+if [ $status -eq 0 ]
+then
+	echo "Receipt failure"
+	rm process.lock
+	exit
+fi
+
+ffmpeg -hide_banner -y -i ${filename} -loglevel quiet \
+	-vf transform360="input_stereo_format=MONO:cube_edge_length=512:interpolation_alg=cubic:enable_low_pass_filter=1:enable_multi_threading=1:num_horizontal_segments=32:num_vertical_segments=15:adjust_kernel=1" \
+	-preset fast -crf 20 -profile:v main \
+	-sc_threshold 0 -g 48 -keyint_min 48 \
+	-map 0:0 -map 0:1 \
+	-map 0:0 -map 0:1 \
+	-map 0:0 -map 0:1 \
+	-map 0:0 -map 0:1 \
+	-c:v:0 libx264 -c:a:0 aac -b:v:0 256k -b:a:0 64k -s:v:0 480x240 \
+	-c:v:1 libx264 -c:a:1 aac -b:v:1 512k -b:a:1 64k -s:v:1 960x480 \
+	-c:v:2 libx264 -c:a:2 aac -b:v:2 1024k -b:a:2 96k -s:v:2 1920x960 \
+	-c:v:3 libx264 -c:a:3 aac -b:v:3 2048k -b:a:3 128k -s:v:3 3840x1920 \
+	-var_stream_map "v:0,a:0 v:1,a:1 v:2,a:2 v:3,a:3" \
+	-master_pl_name ${file}.m3u8 \
+	-f hls -hls_time 2 -hls_list_size 0 \
+	-hls_segment_filename "${directory}/v%v/${filesequence}_03%d.ts" \
+	${directory}/v%v/${filesequence}_index.m3u8
+
+if [ $? -ne 0 ]
+then
+	echo "Conversion failed"
+	rm process.lock
+	exit
+fi
+
+/home/ubuntu/bin/filefinalise $directory $file $team
+#! /bin/bash
+cd /home/ubuntu/processdir
+
+if [ "$#" -ne 3 ]
+then
+        echo "Directory file team is required"
+        exit
+fi
+
+directory=$1
+file=$2
+team=$3
+
+cd $directory
+sed -i "s|^v[0-9].*|https://prometheus.meetingroom.io/videos/$team/$directory/&|g" ${file}.m3u8
+rm .*.swp
+cd ..
+aws s3 cp ${directory} s3://meetingroomv1public/videos/${team}/${directory}/ --recursive --quiet
+aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueue --message-body file://db.json
+rm -rf $directory
+rm *
