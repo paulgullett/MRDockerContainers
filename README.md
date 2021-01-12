@@ -8,4 +8,4 @@ Builds the base image that includes OpenCV 3.4.8 which is required for the Faceb
 
 ## videoprocess
 
-Uses ffmpegopencv to create the image that is used by ECS to process video files for use within the app.
+Uses ffmpegopencv to create the image that is used by ECS to process video files for use within the app. Note this needs the .aws directory to be populated with the appropriate settings.

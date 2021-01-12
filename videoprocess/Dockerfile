@@ -34,7 +34,7 @@ RUN 	apt update 			&& \
 		libx265-146 libvpx5 	  \
 		libfdk-aac1 \
 		libmp3lame0 libopus0	  \
-		jq pwgen bc less
+		jq pwgen bc less cron
 
 RUN 	cd /root			&& \
 	curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
@@ -43,14 +43,8 @@ RUN 	cd /root			&& \
 	aws/install			&& \
 	rm -rf aws awscliv2.zip
 
-RUN	useradd -ms /bin/bash ubuntu
-
-WORKDIR /home/ubuntu
-
 COPY	bin bin
 COPY	.aws .aws
 
-RUN	mkdir processdir		&& \
-	chown -R ubuntu:ubuntu .aws bin processdir
-
-USER 	ubuntu
+RUN	mkdir processdir
+CMD	["/root/bin/fileprocesstest"]

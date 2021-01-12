@@ -1,100 +1,84 @@
 #! /bin/bash
-cd /home/ubuntu/processdir
 
-lockfile=process.lock
+# Script requires an argument this is the name of the file to process
 
-if [ -f "$lockfile" ]
+function_message() {
+
+	completionstatus=$1
+        completionmessage=$2
+
+	jq -n --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" --arg owner "$owner" --arg room "$room" --arg team "$team" --arg filename "$filename" --arg directory "$directory" --arg file "$file" --arg filesequence "$filesequence" '. | .["completionstatus"]=$completionstatus | .["completionmessage"]=$completionmessage | .["owner"]=$owner | .["room"]=$room | .["team"]=$team | .["filename"]=$filename | .["directory"]=$directory | .["file"]=$file| .["filesequence"]=$filesequence' > db.json
+
+        aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueueTest --message-body file://db.json
+
+        rm db.json
+	cd /root/processdir
+	rm -rf $processdirectory
+        exit
+}
+
+if [ "$#" -ne 1 ]
 then
-	echo "Another process is running"
-	exit
-else
-	touch process.lock
-fi
-
-# Start by getting the message from the queue if there is one
-awssqsmessage=$(aws sqs receive-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingQueueTest)
-
-receipt=$(echo ${awssqsmessage} | jq '.Messages' | jq '.[0].ReceiptHandle' | tail -c +2 | head -c -2)
-
-# If there is no message waiting then exit
-
-if [ "$receipt" = "" ]
-then
-	rm process.lock
-	exit
-fi
-
-longfilename=$(echo ${awssqsmessage} | jq '.Messages' | jq '.[0].Body' | tr -d '\\' | tail -c +2 | head -c -2 | jq '.Records' | jq '.[0].s3.object.key' | tr -d '"')
-
-if [ "$longfilename" = "" ]
-then
-	rm process.lock
+	echo "Script needs a filename"
 	exit
 fi
+
+longfilename=$1
+
+processdirectory=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
+directory=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
+file=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
+filesequence=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
+
+cd /root/processdir
+mkdir $processdirectory
+cd $processdirectory
+
+owner=""
+room=""
+team=""
+filename=""
 
 IFS='_' read -r -a array <<< $longfilename
-completionstatus=""
-completionmessage=""
 owner=${array[0]}
 room=${array[1]}
 team=${array[2]}
 filename=${array[3]}
 
-directory=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
-file=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
-filesequence=$(pwgen -s 64 1 | tr '[:upper:]' '[:lower:]')
-
-jq -n --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" --arg owner "$owner" --arg room "$room" --arg team "$team" --arg filename "$filename" --arg directory "$directory" --arg file "$file" --arg filesequence "$filesequence" '. | .["completionstatus"]=$completionstatus | .["completionmessage"]=$completionmessage | .["owner"]=$owner | .["room"]=$room | .["team"]=$team | .["filename"]=$filename | .["directory"]=$directory | .["file"]=$file| .["filesequence"]=$filesequence' > db.json
-
-aws s3 mv s3://meetingroomv1uploadstest/${longfilename} . --quiet
+aws s3 mv s3://meetingroomv1uploadstest/${longfilename} . 
 
 mv ${longfilename} ${filename}
 
-codec=$(/home/ubuntu/bin/ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 ${filename})
+codec=$(/root/bin/ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 ${filename})
 	
 if [ "$codec" != "h264" ]
 then
 	completionstatus="Failed"
 	completionmessage="Not a h264 encoded file."
-	jq --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" '.completionstatus=$completionstatus | .completionmessage=$completionmessage' db.json > db.temp 
-	mv db.temp db.json
-	aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueueTest --message-body file://db.json
-	rm process.lock $filename db.json
-	exit
+	function_message "$completionstatus" "$completionmessage"
 fi
 
-duration=$(/home/ubuntu/bin/ffprobe -v error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 ${filename})
+duration=$(/root/bin/ffprobe -v error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 ${filename})
 	
 if [ $(echo "$duration > 300" | bc) -eq 1 ]
 then
 	completionstatus="Failed"
 	completionmessage="Video should be less than 5mins in length"
-	jq --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" '.completionstatus=$completionstatus | .completionmessage=$completionmessage' db.json > db.temp 
-	mv db.temp db.json
-	aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueueTest --message-body file://db.json
-	rm process.lock $filename db.json
-	exit
+	function_message "$completionstatus" "$completionmessage"
 fi
 
-aws sqs delete-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingQueueTest --receipt-handle "${receipt}"
-status=$?
-
-if [ $status -ne 0 ]
-then
-	completionstatus="Failed"
-	completionmessage="Initial message receipt failure"
-	jq --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" '.completionstatus=$completionstatus | .completionmessage=$completionmessage' db.json > db.temp 
-	mv db.temp db.json
-	aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueueTest --message-body file://db.json
-	rm process.lock $filename db.json
-	exit
-fi
-
-nice -n 15 /home/ubuntu/bin/ffmpeg -hide_banner -y -i ${filename} -loglevel info \
+/root/bin/ffmpeg -hide_banner -y -i ${filename} -loglevel info \
 	-vf transform360="input_stereo_format=MONO:cube_edge_length=512:interpolation_alg=cubic:enable_low_pass_filter=1:enable_multi_threading=1:num_horizontal_segments=32:num_vertical_segments=15:adjust_kernel=1" \
 	proc_${filename}
 
-nice -n 15 /home/ubuntu/bin/ffmpeg -hide_banner -y -i proc_${filename} -loglevel info \
+if [ $? -ne 0 ]
+then
+	completionstatus="Failed"
+	completionmessage="Video pre-processing failure"
+	function_message "$completionstatus" "$completionmessage"
+fi
+
+/root/bin/ffmpeg -hide_banner -y -i proc_${filename} -loglevel info \
 	-preset slow -crf 20 -profile:v main \
 	-sc_threshold 0 -g 48 -keyint_min 48 \
 	-map 0:0 -map 0:1 \
@@ -115,37 +99,24 @@ if [ $? -ne 0 ]
 then
 	completionstatus="Failed"
 	completionmessage="Video conversion failure"
-	jq --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" '.completionstatus=$completionstatus | .completionmessage=$completionmessage' db.json > db.temp 
-	mv db.temp db.json
-	aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueueTest --message-body file://db.json
-	rm process.lock $filename proc_${filename} db.json
-	rm -rf $directory
-	exit
+	function_message "$completionstatus" "$completionmessage"
 fi
 
 cd $directory
 sed -i "s|^v[0-9].*|https://d2bjvz05b4roip.cloudfront.net/videos/$team/$directory/&|g" ${file}.m3u8
 cd ..
-aws s3 cp ${directory} s3://meetingroomv1publictest/videos/${team}/${directory}/ --recursive --quiet
+aws s3 cp ${directory} s3://meetingroomv1publictest/videos/${team}/${directory}/ --recursive 
 
 if [ $? -ne 0 ]
 then
 	completionstatus="Failed"
 	completionmessage="Video move failure"
-	jq --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" '.completionstatus=$completionstatus | .completionmessage=$completionmessage'db.json  > db.temp 
-	mv db.temp db.json
-	aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueueTest --message-body file://db.json
-	rm process.lock $filename proc_${filename} db.json
-	rm -rf $directory
-	exit
+	function_message "$completionstatus" "$completionmessage"
 fi
 
 completionstatus="Success"
 completionmessage="Video conversion complete"
-jq --arg completionstatus "$completionstatus" --arg completionmessage "$completionmessage" '.completionstatus=$completionstatus | .completionmessage=$completionmessage' db.json > db.temp 
-mv db.temp db.json
+function_message "$completionstatus" "$completionmessage"
 
-aws sqs send-message --queue-url https://sqs.eu-west-1.amazonaws.com/451524384759/MRVideoProcessingCompletionQueueTest --message-body file://db.json
-
-rm -rf $directory
-rm process.lock $filename proc_${filename} db.json
+# Exit container
+exit
